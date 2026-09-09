@@ -14,3 +14,6 @@ payload.enc
 
 # 日志
 *.log
+
+# 本地辅助脚本
+push_*.sh
