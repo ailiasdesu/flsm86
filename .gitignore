@@ -1,0 +1,16 @@
+# 构建产物
+bin/
+*.obj
+*.exe
+*.dll
+*.lib
+*.exp
+*.pdb
+*.ilk
+
+# 载荷与缓存（本仓库不包含任何 NVIDIA 二进制）
+*.enc
+payload.enc
+
+# 日志
+*.log
