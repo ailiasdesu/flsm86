@@ -249,3 +249,54 @@ after+20 alive=True      ← 游戏存活！
 | 注入器本体（本仓库） | ✅ 全部隐身属性实测通过（§11.1） |
 | 对无内核反作弊的游戏 | ✅ 可用（注入 + payload 均实测稳定） |
 | 对带内核反作弊（ACE）的游戏 | ⚠️ 注入器不被检测；**上游 payload 的钩子行为被检测**，需改造 payload |
+
+## 14. 第 13 轮：定位 mod 的钩子目标 + 硬边界确认
+
+### 14.1 逆向 mod 的钩子安装（IDA）
+
+`DllEntryPoint` → `sub_18001E7C8`（CRT）→ 用户 `DllMain` `sub_1800127C0`；
+attach 分支为 `sub_180010C80`：
+
+```c
+GetModuleFileNameW(hinstDLL, ...);                  // 用自身模块句柄取路径
+path = "%SystemRoot%\\System32\\version.dll";
+Library = LoadLibraryExW(path, 0, LOAD_LIBRARY_SEARCH_SYSTEM32);
+for (i = 0; i < 17; ++i) ptr[i] = GetProcAddress(Library, name[i]);
+if (!DetourTransactionBegin()) {
+    DetourUpdateThread(GetCurrentThread());
+    DetourAttach(&ptr[0], hook0);   // sub_18000D1D0
+    DetourAttach(&ptr[1], hook1);   // sub_18000D0E0
+    DetourAttach(&ptr[2], hook2);   // sub_18000CEE0
+    DetourAttach(&ptr[3], hook3);   // sub_18000CEF0
+    if (ok) g_hooked = (DetourTransactionCommit() == 0);
+    else DetourTransactionAbort();
+}
+```
+
+→ **mod 挂钩的是系统 `version.dll` 的 4 个函数**（代理转发用），不是 `CreateFileW`。
+
+### 14.2 针对性实验
+
+最小载荷：对 `C:\Windows\System32\version.dll!GetFileVersionInfoSizeW` 做一次
+`VirtualProtect(PAGE_EXECUTE_READWRITE)` → 写 6 字节 → 立刻还原 → 恢复保护。
+
+```
+已注入: base=... size=0x4000 (无 LoadImage / 无 PEB 条目)
+after+5 alive=False
+exit 0xC0000005
+```
+
+**结论**：ACE 的检测**不限于它自己挂钩的函数**——**任何对系统模块代码页的写权限变更/写入都会被终止**
+（第 7 轮已确认绕过用户态 `VirtualProtect` 钩子（改调 `NtProtectVirtualMemory`）同样触发，
+说明检测在内核层）。
+
+### 14.3 硬边界
+
+| 事实 | 含义 |
+|---|---|
+| ACE 内核驱动监控系统模块代码页写入 | 用户态**任何内联钩子方案**都会被检测 |
+| 上游 mod 的核心机制 = 对 `version.dll` 的内联钩子 | **在 ACE 游戏内无法运行**（与注入方式无关） |
+| 注入器本身不触碰任何代码页 | 注入器不被检测 ✅ |
+
+要在 ACE 游戏内使用，只能**改写 payload 的转发机制**（内联钩子 → IAT/导出转发等不改写代码页的方案），
+这属于对上游 payload 的改造，不属于注入器范畴。
