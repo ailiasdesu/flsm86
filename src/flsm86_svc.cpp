@@ -36,6 +36,7 @@ static ULONG_PTR ResolveRemoteExport(HANDLE hProc, const char* module, const cha
 static ULONG_PTR AddTempPebEntry(HANDLE hProc, ULONG_PTR base, ULONG_PTR entryPoint,
                                  SIZE_T sizeOfImage, const std::wstring& dllPath);
 static bool UnlinkFromPeb(HANDLE hProc, ULONG_PTR moduleBase);
+static bool UnlinkByEntry(HANDLE hProc, ULONG_PTR entry);
 static ULONG_PTR GetRemotePeb(HANDLE hProc);
 static bool g_forceReloc;   // 强制非首选基址（验证重定位路径）
 static bool g_stomp;        // 模块踩踏：把载荷放进已加载模块的空白区
@@ -917,7 +918,11 @@ static Mapped MapRemote(HANDLE hProc, std::vector<BYTE>& file, bool strip, bool 
                         Mapped bm = MapRemote(hProc, bd, /*strip=*/false, /*runEntry=*/true);
                         if (bm.ok) {
                             g_bundleMap.push_back({ fd2.cFileName, (ULONG_PTR)bm.base });
-                            LOG("      预映射 bundle: %ls -> %p\n", fd2.cFileName, bm.base);
+                            // bundle 也要进 PEB 模块表，否则加载器/内部 GetModuleHandle 会崩
+                            ULONG_PTR pe = AddTempPebEntry(hProc, (ULONG_PTR)bm.base, 0,
+                                                           bm.size, path);
+                            LOG("      预映射 bundle: %ls -> %p (PEB 表项=%s)\n",
+                                fd2.cFileName, bm.base, pe ? "已插入" : "失败");
                         }
                     } while (FindNextFileW(h2, &fd2));
                     FindClose(h2);
@@ -997,9 +1002,20 @@ static Mapped MapRemote(HANDLE hProc, std::vector<BYTE>& file, bool strip, bool 
                 // 拦截 VirtualProtect*：让载荷的 Detours 装不上内联钩子。
                 // ACE 内核层会检测"对被挂钩代码页的写权限变更"，直接放行会被终止；
                 // bundle 的重定向改由上面的 LoadLibrary 拦截桩完成。
-                if (retZero && g_blockProtect &&
-                    (strcmp(curName, "VirtualProtect") == 0 ||
-                     strcmp(curName, "VirtualProtectEx") == 0)) {
+                // 拦截 Detours 事务所需的全部 API：让载荷的内联钩子安装直接失败
+                static const char* kDetourApis[] = {
+                    "VirtualProtect", "VirtualProtectEx", "SuspendThread", "ResumeThread",
+                    "GetThreadContext", "SetThreadContext", "FlushInstructionCache",
+                    "VirtualAlloc", "VirtualAllocEx", "VirtualFree"
+                };
+                bool blockThis = false;
+                if (retZero) {
+                    if (g_blockProtect) {
+                        for (const char* a : kDetourApis)
+                            if (strcmp(curName, a) == 0) { blockThis = true; break; }
+                    }
+                }
+                if (blockThis) {
                     WriteProcessMemory(hProc, (LPVOID)ftAddr, &retZero, sizeof(retZero), nullptr);
                     resolved++;
                     oftAddr += sizeof(ULONG64); ftAddr += sizeof(ULONG64);
@@ -1086,7 +1102,11 @@ static Mapped MapRemote(HANDLE hProc, std::vector<BYTE>& file, bool strip, bool 
                 } else LOG("      !! 线程劫持失败\n");
             }
         }
-        if (tempEntry) { UnlinkFromPeb(hProc, tempEntry); LOG("      临时 PEB 表项已摘除\n"); }
+        // 注意：UnlinkFromPeb 按 DllBase 匹配，必须传映像基址（不是表项地址）
+        if (tempEntry) {
+            bool ok = UnlinkByEntry(hProc, tempEntry);
+            LOG("      临时 PEB 表项摘除: %s\n", ok ? "成功（按表项指针）" : "失败");
+        }
     }
 
     out.base = base; out.size = imageSize; out.ok = true;
@@ -1148,6 +1168,8 @@ static ULONG_PTR AddTempPebEntry(HANDLE hProc, ULONG_PTR base, ULONG_PTR entryPo
     ws(0x5A, (USHORT)baseBytes);
     wq(0x60, baseBuf);
 
+    printf("      [peb] ldr=%p entry=%p base=%p entryPoint=%p\n",
+           (void*)ldr, (void*)entry, (void*)base, (void*)entryPoint);
     // 挂到三个链表头部
     const int listOffsets[3] = { 0x00, 0x10, 0x20 };
     for (int i = 0; i < 3; ++i) {
@@ -1162,9 +1184,31 @@ static ULONG_PTR AddTempPebEntry(HANDLE hProc, ULONG_PTR base, ULONG_PTR entryPo
         // first->Blink = node; head->Flink = node
         WriteProcessMemory(hProc, (LPVOID)(first + 8), &node, sizeof(node), nullptr);
         WriteProcessMemory(hProc, (LPVOID)head, &node, sizeof(node), nullptr);
+        ULONG_PTR check = 0;
+        ReadProcessMemory(hProc, (LPCVOID)head, &check, sizeof(check), nullptr);
+        printf("      [peb] list[%d] head=%p first=%p -> after=%p (node=%p) %s\n",
+               i, (void*)head, (void*)first, (void*)check, (void*)node,
+               check == node ? "OK" : "FAIL");
     }
-    LOG("      已临时插入 PEB 表项 base=%p（DllMain 后摘除）\n", (void*)base);
-    return base;
+    LOG("      已临时插入 PEB 表项 base=%p entry=%p（DllMain 后摘除）\n", (void*)base, (void*)entry);
+    return entry;   // 返回表项地址（摘链时按指针操作最可靠）
+}
+
+// 按表项指针直接摘链（不依赖 DllBase 匹配）
+static bool UnlinkByEntry(HANDLE hProc, ULONG_PTR entry) {
+    const int nodeOffs[3] = { 0x00, 0x10, 0x20 };
+    int done = 0;
+    for (int i = 0; i < 3; ++i) {
+        ULONG_PTR node = entry + nodeOffs[i];
+        ULONG_PTR flink = 0, blink = 0;
+        if (!ReadProcessMemory(hProc, (LPCVOID)node, &flink, sizeof(flink), nullptr)) continue;
+        if (!ReadProcessMemory(hProc, (LPCVOID)(node + 8), &blink, sizeof(blink), nullptr)) continue;
+        if (!flink || !blink) continue;
+        WriteProcessMemory(hProc, (LPVOID)(blink), &flink, sizeof(flink), nullptr);   // blink->Flink = flink
+        WriteProcessMemory(hProc, (LPVOID)(flink + 8), &blink, sizeof(blink), nullptr); // flink->Blink = blink
+        done++;
+    }
+    return done > 0;
 }
 
 static bool UnlinkFromPeb(HANDLE hProc, ULONG_PTR moduleBase) {
@@ -1443,10 +1487,32 @@ static const char* NearestExport(HMODULE mod, ULONG_PTR rva) {
                 HANDLE ht = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, de.dwThreadId);
                 if (ht) {
                     CONTEXT ctx; ZeroMemory(&ctx, sizeof(ctx)); ctx.ContextFlags = CONTEXT_FULL;
-                    if (GetThreadContext(ht, &ctx))
+                    if (GetThreadContext(ht, &ctx)) {
                         printf("      [dbg]   RIP=%p RSP=%p RBP=%p RAX=%p RCX=%p RDX=%p\n",
                                (void*)ctx.Rip, (void*)ctx.Rsp, (void*)ctx.Rbp,
                                (void*)ctx.Rax, (void*)ctx.Rcx, (void*)ctx.Rdx);
+                        // 栈回溯：读 RSP 附近的返回地址，解析所属模块
+                        HANDLE hp2 = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+                        if (hp2) {
+                            ULONG_PTR words[96] = {0}; SIZE_T rd2 = 0;
+                            ReadProcessMemory(hp2, (LPCVOID)ctx.Rsp, words, sizeof(words), &rd2);
+                            printf("      [dbg]   --- 栈回溯 ---\n");
+                            for (size_t w = 0; w < rd2 / sizeof(ULONG_PTR); ++w) {
+                                ULONG_PTR v = words[w];
+                                if (v < 0x10000) continue;
+                                HMODULE hm = nullptr;
+                                if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                                        (LPCWSTR)v, &hm) || !hm) continue;
+                                char mn[MAX_PATH] = {0};
+                                GetModuleFileNameExA(hp2, hm, mn, MAX_PATH);
+                                const char* base = strrchr(mn, '\\'); base = base ? base + 1 : mn;
+                                printf("      [dbg]     [rsp+%02zX] %p  %s+0x%llX\n", w * 8, (void*)v,
+                                       base, (unsigned long long)(v - (ULONG_PTR)hm));
+                            }
+                            CloseHandle(hp2);
+                        }
+                    }
                     CloseHandle(ht);
                 }
                 BYTE code[16] = {0}; SIZE_T rd = 0;
