@@ -524,3 +524,22 @@ UnlinkByEntry（按表项指针摘链）在本轮日志中显示「成功（按�
 | 带内核反作弊（ACE）的游戏 | 磁盘替换 nvngx_dlssg.dll（版本补丁 + SM86 运行时），启动阶段实测可用 |
 
 两者共存：注入器负责常规游戏，ACE 游戏走磁盘替换。
+## 22. 第 24 轮：不做登录的加载路径观察
+
+直接把补丁版 nvngx_dlssg.dll 部署到游戏目录并启动 HTGame.exe，观察 90 秒内加载了哪些 NGX 模块：
+
+    第 1 次检查(15s): 已加载 DLSS 模块
+       _nvngx.dll
+       nvngx_deepdvc.dll
+       nvngx_dlss.dll        <- 超分
+       nvngx_dlssd.dll       <- 光线重建
+    最终模块列表: ACE-Base64.dll / _nvngx.dll / nvngx_deepdvc.dll / nvngx_dlss.dll / nvngx_dlssd.dll
+
+观察结论：
+- 游戏确实会从**自己的目录**加载 NGX 系列 DLL（正常 LoadImage + 正常模块）
+- **nvngx_dlssg.dll（帧生成）不在其中**——它只在启用帧生成时才加载（需要进入游戏画面并在设置里开启）
+- 全程 **ACE-Base64.dll 在场，游戏存活**（说明被替换的 nvngx_dlssg.dll 放在游戏目录里并不会被 ACE 处理）
+
+因此「游戏是否真的用上 SM86 运行时」这一步**必须在登录并开启帧生成后才能观察**：
+
+    .\scripts\verify_ingame.ps1
