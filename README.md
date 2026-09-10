@@ -80,3 +80,30 @@ powershell -ExecutionPolicy Bypass -File scripts\install.ps1
 - **本仓库不包含任何 NVIDIA 二进制**（`nvngx_dlssg.dll`、重编译内核等）。
   载荷由使用者自行 `--pack`，请确保你合法持有并遵守上游与 NVIDIA 的条款。
 - 本项目**源码**遵循 **GPL-3.0-or-later**，见 `LICENSE`；来源与合规见 `NOTICE.md`。
+## 两种使用路径（按游戏是否有内核反作弊选择）
+
+| 场景 | 方案 | 实测 |
+|---|---|---|
+| 无内核反作弊的游戏 | **注入器**（本文上面全部内容）：零磁盘文件、不触发 LoadImage、0ms CPU | ✅ 夹具 11/11、真实游戏注入稳定 |
+| 带内核反作弊（ACE 等） | **磁盘替换** `nvngx_dlssg.dll`：用 `scripts/deploy_dlssg.ps1` 把 SM86 版（版本补丁后）部署到游戏目录 | ✅ 启动阶段实测存活 45s+，ACE 无反应 |
+
+### 为什么 ACE 游戏必须走磁盘替换
+
+实测（详见 `docs/VERIFICATION.md` 第 7/13/14/21 节）ACE 的内核驱动会终止：
+
+- 对任何已加载模块的**代码页**写权限变更 / 写入（内联钩子）
+- 对**游戏自身 IAT（数据页）**的写入
+- 从无后备内存发起被挂钩 API 调用（此条已被本注入器的"合法模块跳板"绕过）
+- 调用 `nvngx_dlssg.dll` 的 `DllMain`（本注入器已通过不调入口来规避）
+
+而磁盘替换的加载过程是**正常的 LoadImage + 正常模块**，不在上述任何一条之内。
+
+```powershell
+# 部署（自动备份原文件 + 自动对齐版本号）
+.\scripts\deploy_dlssg.ps1 -GameDir "E:\...\StreamlineCore\Binaries\ThirdParty\Win64" -Sm86Dll "C:\...\nvngx_dlssg.dll"
+# 还原
+.\scripts\deploy_dlssg.ps1 -GameDir "E:\...\Win64" -Restore
+```
+
+`tools/patch_ver.py` 负责版本对齐：把 SM86 版的版本资源（`310,1,0,0`）原地改成游戏期望的版本
+（如 `310,5,2,0`），使游戏的版本校验通过 —— **不再需要运行时钩版本 API**。
