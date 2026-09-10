@@ -487,3 +487,40 @@ UnlinkByEntry（按表项指针摘链）在本轮日志中显示「成功（按�
 游戏是否真的**使用**了我们映射的 DLL（即 `LoadLibrary` 拦截是否被命中、
 以及 `GetProcAddress` 在我们映射的映像上是否正常工作——bundle 映射时保留了 PE 头，因此应当正常）。
 这需要进入游戏渲染路径才能确认（本机《异环》需要登录）。
+## 21. 第 21 轮：LoadLibrary 拦截的真实边界 + 磁盘替换方案实测
+
+### 21.1 拦截桩的边界（重要更正）
+
+用一个模拟游戏的测试程序验证拦截桩：
+
+    [test] LoadLibrary -> 00007FFAF9910000 (err=0)      <- 系统 DLL 区，不是我们预映射的 0x23E0000
+    [test] GetProcAddress(NVSDK_NGX_D3D12_Init) -> 00007FFAF99317E0
+    [test] GetModuleFileName -> C:\...\nvngx_dlssg.dll
+
+结论：LoadLibrary 拦截桩**只对载荷自己的导入表生效**。
+游戏自己调 LoadLibrary 走的是真实 API，从磁盘加载它自己那份。
+（要拦游戏自己的调用只能改它的 IAT = 改数据页 = 被 ACE 检测，第 14 轮已证。）
+
+### 21.2 磁盘替换实测（决定性）
+
+把游戏目录的 nvngx_dlssg.dll 换成版本补丁后的 SM86 版（310,5,2,0），不做任何注入：
+
+    已替换, 版本=310,5,2,0
+    after+5  alive=True
+    after+10 alive=True
+    after+20 alive=True
+    after+30 alive=True
+    after+45 alive=True        <- 游戏存活，ACE 无反应
+
+结论：
+- ACE 不因「游戏加载了被修改的 nvngx_dlssg.dll」而终止进程（至少启动阶段）
+- 这条路径完全不需要运行时注入：文件在游戏启动前就已就位，加载时是正常的 LoadImage + 正常模块
+
+### 21.3 分工结论（对要求 4 的回答）
+
+| 场景 | 可行方案 |
+|---|---|
+| 无内核反作弊的游戏 | 注入器（零磁盘文件、全隐身） |
+| 带内核反作弊（ACE）的游戏 | 磁盘替换 nvngx_dlssg.dll（版本补丁 + SM86 运行时），启动阶段实测可用 |
+
+两者共存：注入器负责常规游戏，ACE 游戏走磁盘替换。
