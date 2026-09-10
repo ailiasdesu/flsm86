@@ -41,6 +41,12 @@ static ULONG_PTR GetRemotePeb(HANDLE hProc);
 static bool g_forceReloc;   // 强制非首选基址（验证重定位路径）
 static bool g_stomp;        // 模块踩踏：把载荷放进已加载模块的空白区
 static bool g_blockProtect = false;   // 拦截载荷的 VirtualProtect（阻止它装内联钩子）
+static bool g_bundlePeb = false;      // 是否给预映射的 bundle 加 PEB 表项（默认不加：会被 ACE 检测）
+static int g_probeKb = 8192;          // --probe-bigexec 的块大小（KB）
+// 预映射 bundle 时默认【不】调用它的 DllMain：实测调用会触发反作弊终止（第 19 轮），
+// 而不调用时游戏可稳定存活；DLL 的初始化交给游戏自身的导出调用路径。
+static bool g_bundleRunEntry = false;
+static bool g_mapNox = false;         // 映射后整块设 PAGE_NOACCESS（--map-nox）
 
 #pragma comment(lib, "psapi.lib")
 
@@ -915,14 +921,21 @@ static Mapped MapRemote(HANDLE hProc, std::vector<BYTE>& file, bool strip, bool 
                         std::wstring path = d + L"\\" + fd2.cFileName;
                         std::vector<BYTE> bd = ReadAll(path);
                         if (bd.empty()) continue;
-                        Mapped bm = MapRemote(hProc, bd, /*strip=*/false, /*runEntry=*/true);
+                        Mapped bm = MapRemote(hProc, bd, /*strip=*/false, /*runEntry=*/g_bundleRunEntry);
                         if (bm.ok) {
                             g_bundleMap.push_back({ fd2.cFileName, (ULONG_PTR)bm.base });
-                            // bundle 也要进 PEB 模块表，否则加载器/内部 GetModuleHandle 会崩
-                            ULONG_PTR pe = AddTempPebEntry(hProc, (ULONG_PTR)bm.base, 0,
-                                                           bm.size, path);
+                            // 注意：给 bundle 加 PEB 表项会让它在模块枚举里可见（未签名模块 → ACE 会终止进程），
+                            // 因此默认不加表项；仅在 --bundle-peb 下插入（用于实验）。
+                            ULONG_PTR pe = 0;
+                            if (g_bundlePeb)
+                                pe = AddTempPebEntry(hProc, (ULONG_PTR)bm.base, 0, bm.size, path);
                             LOG("      预映射 bundle: %ls -> %p (PEB 表项=%s)\n",
-                                fd2.cFileName, bm.base, pe ? "已插入" : "失败");
+                                fd2.cFileName, bm.base, pe ? "已插入" : "未插入");
+                            if (g_mapNox) {   // 实验：整块设为不可访问（模拟加密驻留）
+                                DWORD o = 0;
+                                VirtualProtectEx(hProc, bm.base, bm.size, PAGE_NOACCESS, &o);
+                                LOG("      [nox] bundle 已设为 PAGE_NOACCESS\n");
+                            }
                         }
                     } while (FindNextFileW(h2, &fd2));
                     FindClose(h2);
@@ -1203,6 +1216,7 @@ static bool UnlinkByEntry(HANDLE hProc, ULONG_PTR entry) {
         ULONG_PTR flink = 0, blink = 0;
         if (!ReadProcessMemory(hProc, (LPCVOID)node, &flink, sizeof(flink), nullptr)) continue;
         if (!ReadProcessMemory(hProc, (LPCVOID)(node + 8), &blink, sizeof(blink), nullptr)) continue;
+        printf("      [unlink] node[%d]=%p flink=%p blink=%p\n", i, (void*)node, (void*)flink, (void*)blink);
         if (!flink || !blink) continue;
         WriteProcessMemory(hProc, (LPVOID)(blink), &flink, sizeof(flink), nullptr);   // blink->Flink = flink
         WriteProcessMemory(hProc, (LPVOID)(flink + 8), &blink, sizeof(blink), nullptr); // flink->Blink = blink
@@ -1588,6 +1602,45 @@ static const char* NearestExport(HMODULE mod, ULONG_PTR rva) {
         else if (a == L"--force-reloc") g_forceReloc = true;
         else if (a == L"--stomp") g_stomp = true;
         else if (a == L"--block-protect") g_blockProtect = true;
+        else if (a == L"--bundle-peb") g_bundlePeb = true;
+        else if (a == L"--probe-kb" && i + 1 < argc) g_probeKb = _wtoi(argv[++i]);
+        else if (a == L"--bundle-norun") g_bundleRunEntry = false;
+        else if (a == L"--bundle-run") g_bundleRunEntry = true;   // 实验用：启用 bundle 的 DllMain
+        else if (a == L"--map-nox") g_mapNox = true;
+        else if (a == L"--probe-file" && i + 2 < argc) {
+            // 实验：把某个文件的字节原样放进目标进程的私有可执行内存（不做 PE 语义）
+            // 用于判定 ACE 是否在做"内存内容特征扫描"
+            DWORD pid = _wtoi(argv[++i]);
+            std::wstring fp = argv[++i];
+            HANDLE hp = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, FALSE, pid);
+            if (!hp) { printf("OpenProcess 失败 %lu\n", GetLastError()); return 1; }
+            std::vector<BYTE> d = ReadAll(fp);
+            if (d.empty()) { printf("读文件失败\n"); return 1; }
+            void* p = VirtualAllocEx(hp, nullptr, d.size(), MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+            printf("探测: 文件 %ls (%zu 字节) -> %p\n", fp.c_str(), d.size(), p);
+            if (p && WriteProcessMemory(hp, p, d.data(), d.size(), nullptr))
+                printf("      已写入（内容与文件完全一致）\n");
+            CloseHandle(hp);
+            return 0;
+        }
+        else if (a == L"--probe-bigexec" && i + 1 < argc) {
+            // 实验：在目标里放一块 N KB 的私有可执行内存（模拟大 .text），观察 ACE 是否据此判定
+            DWORD pid = _wtoi(argv[++i]);
+            HANDLE hp = OpenProcess(PROCESS_VM_OPERATION | PROCESS_VM_WRITE, FALSE, pid);
+            if (!hp) { printf("OpenProcess 失败 %lu\n", GetLastError()); return 1; }
+            SIZE_T sz = (SIZE_T)g_probeKb * 1024;
+            void* p = VirtualAllocEx(hp, nullptr, sz, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+            printf("探测: 申请 %zu KB 私有可执行内存 -> %p\n", (SIZE_T)g_probeKb, p);
+            if (p) {
+                std::vector<BYTE> buf(4096);
+                for (size_t k = 0; k < 4096; ++k) buf[k] = (BYTE)(k * 7 + 0x40);
+                for (SIZE_T off = 0; off < sz; off += 4096)
+                    WriteProcessMemory(hp, (LPBYTE)p + off, buf.data(), 4096, nullptr);
+                printf("      已填充，保持可执行可写\n");
+            }
+            CloseHandle(hp);
+            return 0;
+        }
         else if (a == L"--scan-slack" && i + 1 < argc) {
             // 扫描目标进程各模块的可执行节尾部空白（找模块踩踏的落点）
             DWORD pid = _wtoi(argv[++i]);
